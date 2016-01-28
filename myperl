@@ -1,0 +1,966 @@
+package refTimeSeries;
+$VERSION = 1.1;
+
+# POD documentation at end of file
+
+# Data structures:
+#
+# $self->{ACManager}
+#   Stores the Win32::OLE instance of BCACAPI.ACManager
+#
+# $self->{ACEnvironment}
+#   Stores the AC connection variables
+#
+# $self->{Constants}
+#   Stores the BCACAPI.ACManager constants (only after connect() has been run)
+#
+# $self->{Cache}{TSData}
+#   Stores cached timeseries data, with the following keys:
+#   $self->{Cache}{TSData}{$tree_id}{$symbol}{$date}{$field} = $data;
+#
+# $self->{Cache}{TSStatus}
+#   Stores cached timeseries status, with the following keys:
+#   $self->{Cache}{TSStatus}{$tree_id}{$symbol}{$date}{$field} = $status;
+#
+# $self->{Cache}{ExternalCodes}
+#   Stores cached list of external codes, with the following keys:
+#   $self->{Cache}{ExternalCodes}{$symbol}{$externalcodetype} = $code;
+#
+# $self->{Cache}{ValidTreeIDs}
+#   Stores cached list of valid tree IDs, used to check that a specified $tree_id is valid
+#
+# $self->{_SuppressInfo}
+#   Internal setting; suppresses info messages
+
+use Win32::OLE;
+use Win32::OLE::Const;
+
+use strict;
+
+use refExit 1.1 qw (&succeed &fail &retsucceed &retfail &topfail);
+use refLog  1.0 qw (&initLog &closeLog &info &log
+                    &warning &error &debug &trace);
+
+#=============================================================================
+# PUBLIC METHODS
+#=============================================================================
+#-----------------------------------------------------------------------------
+# Method:        new
+# Arguments:     $invocant                  Either reference to parent or name of module
+#                $ac_server                 AC server name
+#                $ac_username               AC username
+#                $ac_password               AC password
+#                $ac_update_server_address  AC Query Server Address
+#                $ac_query_server_address   AC Update Server Address
+#                $ac_timeout                AC connection timeout (in seconds)
+#                $suppress_info             Flag for whether to suppress the printing of INFO messages
+# Return Values: Reference to new object
+# Description:   Creates a new refTimeSeries instance 
+#-----------------------------------------------------------------------------
+
+sub new {
+    my ($invocant, $ac_server, $ac_username, $ac_password, $ac_update_server_address, $ac_query_server_address, $ac_timeout, $suppress_info) = @_;
+
+    my $self = {};
+    bless ($self, ref $invocant || $invocant);
+
+    $self->{ACManager} = Win32::OLE->new('BCACAPI.ACManager') or fail("Cannot create new OLE BCACAPI.ACManager object: $?");
+
+    if ($suppress_info) {
+        $self->suppressInfo($suppress_info);
+    }
+
+    if ($ac_server || $ac_username || $ac_password || $ac_update_server_address || $ac_query_server_address || $ac_timeout) {
+        $self->connect($ac_server, $ac_username, $ac_password, $ac_update_server_address, $ac_query_server_address, $ac_timeout);
+    }
+    
+    return $self;
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        DESTROY
+# Arguments:     $self                      Object reference
+# Return Values: none
+# Description:   Builtin destructor
+#-----------------------------------------------------------------------------
+
+sub DESTROY {
+    my ($self) = @_;
+    $self->disconnect;
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        cacheADOTimeSeriesByDate
+# Arguments:     $self                      Object reference
+#                $tree_id                   AC tree ID
+#                $symbols                   Either a single scalar ADO symbol, or
+#                                           a reference to an array of ADO symbols
+#                $date                      Date in YYYYMMDD format
+#                @attributes                Array of attributes
+# Return Values: Reference to cached data
+# Description:   Wrapper around call to cacheADOTimeSeriesByDateRange
+#-----------------------------------------------------------------------------
+
+sub cacheADOTimeSeriesByDate {
+    my ($self, $tree_id, $symbols, $date, @attributes) = @_;
+    fail("Date must be in YYYYMMDD format") unless ($date =~ /^\d{8}$/);
+    my $start_date .= "${date}000000";
+    my $end_date .= "${date}235959";
+    return $self->cacheADOTimeSeriesByDateRange($tree_id, $symbols, $start_date, $end_date, @attributes);
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        cacheADOTimeSeriesByDateRange
+# Arguments:     $self                      Object reference
+#                $tree_id                   AC tree ID
+#                $symbols                   Either a single scalar ADO symbol, or
+#                                           a reference to an array of ADO symbols
+#                $start_date                Date in YYYYMMDD or YYYYMMDDHHMMSS format
+#                $end_date                  Date in YYYYMMDD or YYYYMMDDHHMMSS format
+#                @attributes                Array of attributes
+# Return Values: Reference to cached data
+# Description:   Caches AC timeseries data in the specified date range for the specified list
+#                of ADO symbols and attributes from the specified tree
+#-----------------------------------------------------------------------------
+
+sub cacheADOTimeSeriesByDateRange {
+    my ($self, $tree_id, $symbols, $start_date, $end_date, @attributes) = @_;
+
+    fail("Start date must be in YYYYMMDD or YYYYMMDDHHMMSS format") unless ($start_date =~ /^(\d{8}|\d{14})$/);
+    fail("End date must be in YYYYMMDD or YYYYMMDDHHMMSS format") unless ($end_date =~ /^(\d{8}|\d{14})$/);
+    $start_date .= "000000" if ($start_date =~ /^\d{8}$/);
+    $end_date .= "235959" if ($end_date =~ /^\d{8}$/);
+
+    if (!$self->{ACManager}->IsConnected) {
+        fail("Not connected to Asset Control");
+    }
+
+    # Convert AC format date (YYYYMMDD or YYYYMMDDHHMMSS) to COM format date (specific to OS)
+    my $com_start_date = $self->{ACManager}->ConvertACDateTimeToCOMDateTime($start_date);
+    my $com_end_date = $self->{ACManager}->ConvertACDateTimeToCOMDateTime($end_date);
+    fail("Invalid start or end dates") if ($com_start_date eq "00:00:00" || $com_end_date eq "00:00:00");
+
+    my $ts_options = $self->{ACManager}->CreateTSRetrievalOptions();
+    $ts_options->SetWindowDateTimes($com_start_date, $com_end_date);
+
+    info("Retrieving time series data for tree $tree_id with date $start_date to $end_date") unless ($self->{_SuppressInfo});
+    return $self->_cacheADOTimeSeries($ts_options, 1, $tree_id, $symbols, @attributes);
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        cacheADOTimeSeriesLatest
+# Arguments:     $self                      Object reference
+#                $tree_id                   AC tree ID
+#                $symbols                   Either a single scalar ADO symbol, or
+#                                           a reference to an array of ADO symbols
+#                @attributes                Array of attributes
+# Return Values: Reference to cached data
+# Description:   Caches latest timeseries data for the specified list of
+#                ADO symbols and attributes from the specified tree
+#-----------------------------------------------------------------------------
+
+sub cacheADOTimeSeriesLatest {
+    my ($self, $tree_id, $symbols, @attributes) = @_;
+
+    if (!$self->{ACManager}->IsConnected) {
+        fail("Not connected to Asset Control");
+    }
+
+    my $ts_options = $self->{ACManager}->CreateTSRetrievalOptions();
+    $ts_options->SetWindowLastNRecords(1);
+
+    info("Retrieving latest time series data for tree $tree_id") unless ($self->{_SuppressInfo});
+    return $self->_cacheADOTimeSeries($ts_options, 1, $tree_id, $symbols, @attributes);
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        cacheADOTimeSeriesFull
+# Arguments:     $self                      Object reference
+#                $fetch_ts_status           If true, time series status values
+#                                           are fetched
+#                $tree_id                   AC tree ID
+#                $symbols                   Either a single scalar ADO symbol, or
+#                                           a reference to an array of ADO symbols
+#                @attributes                Array of attributes
+# Return Values: Reference to cached data
+# Description:   Caches full timeseries data for the specified list of
+#                ADO symbols and attributes from the specified tree
+#-----------------------------------------------------------------------------
+
+sub cacheADOTimeSeriesFull {
+    my ($self, $fetch_ts_status, $tree_id, $symbols, @attributes) = @_;
+
+    if (!$self->{ACManager}->IsConnected) {
+        fail("Not connected to Asset Control");
+    }
+
+    my $ts_options = $self->{ACManager}->CreateTSRetrievalOptions();
+
+    info("Retrieving full time series data for tree $tree_id") unless ($self->{_SuppressInfo});
+    return $self->_cacheADOTimeSeries($ts_options, $fetch_ts_status, $tree_id, $symbols, @attributes);
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        clearCache
+# Arguments:     $self                      Object reference
+# Return Values: none
+# Description:   Clears cache
+#-----------------------------------------------------------------------------
+
+sub clearCache {
+    my ($self) = @_;
+    delete $self->{Cache};
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        connect
+# Arguments:     $self                      Object reference
+#                $ac_server                 AC server name
+#                $ac_username               AC username
+#                $ac_password               AC password
+#                $ac_update_server_address  AC Query Server Address
+#                $ac_query_server_address   AC Update Server Address
+#                $ac_timeout                AC connection timeout (in seconds)
+# Return Values: none
+# Description:   Connects to AC via API. Will fail if connection not available.
+#-----------------------------------------------------------------------------
+
+sub connect {
+    my ($self, $ac_server, $ac_username, $ac_password, $ac_update_server_address, $ac_query_server_address, $ac_timeout) = @_;
+    
+    if ($ac_server || $ac_username || $ac_password || $ac_update_server_address || $ac_query_server_address || $ac_timeout) {
+        $self->setEnvironment($ac_server, $ac_username, $ac_password, $ac_update_server_address, $ac_query_server_address, $ac_timeout);
+    }
+    
+    info("Connecting to $self->{ACEnvironment}{Server} as $self->{ACEnvironment}{UserName}") unless ($self->{_SuppressInfo});
+    $self->{ACManager}->ConnectToEnvironment($self->{ACEnvironment});
+    my $ole_error = Win32::OLE->LastError();
+
+    if (!($self->{ACManager}->IsConnected)) {
+        fail("Failed to connect: $ole_error");
+    }
+
+    my $BCACAPI = "Barclays Capital Asset Control API";
+    $self->{Constants} = Win32::OLE::Const->Load($BCACAPI);
+
+    info("BCACAPI.ACManager v" . $self->{ACManager}->VersionString() . " connected to $self->{ACEnvironment}{Server} as $self->{ACEnvironment}{UserName}") unless ($self->{_SuppressInfo});
+
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        disconnect
+# Arguments:     $self                      Object reference
+# Return Values: none
+# Description:   Disconnects from AC if connected
+#-----------------------------------------------------------------------------
+
+sub disconnect {
+    my ($self) = @_;
+    if ($self->{ACManager}) {
+        info("BCACAPI.ACManager v" . $self->{ACManager}->VersionString() . " disconnecting") unless ($self->{_SuppressInfo});
+        $self->{ACManager}->Disconnect;
+    }
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        getExternalCode
+# Arguments:     $self                      Object reference
+#                $symbol                    ADO symbol
+#                $ect                       External code type
+# Return Values: External code
+# Description:   Returns the external code for the specified ADO symbol and
+#                external code type
+#-----------------------------------------------------------------------------
+
+sub getExternalCode {
+    my ($self, $symbol, $ect) = @_;
+
+    if (!$symbol || !$ect) {
+        return undef;
+    }
+    
+    if (!defined $self->{Cache}{ExternalCodes}{$symbol}{$ect}) {
+        $self->{Cache}{ExternalCodes}{$symbol}{$ect} = $self->{ACManager}->GetExternalCode($symbol, $ect)->Code;
+    }
+    return $self->{Cache}{ExternalCodes}{$symbol}{$ect};
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        getTSData
+# Arguments:     $self                      Object reference
+#                $tree_id                   AC tree ID (optional)
+#                $symbol                    ADO symbol (optional)
+#                $date                      Date in YYYYMMDD or YYYYMMDDHHMMSS format (optional)
+#                $field                     AC field name (optional)
+# Return Values: see below
+# Description:   If $date is in YYYYMMDDHHMMSS format, or is not specified:
+#                Returns either the cached timeseries data for the specified
+#                parameters (if all parameters are specified) or a reference
+#                to a multi-level hash containing the remaining data (i.e.
+#                specifying $tree_id and $symbol will return a 2 level hash
+#                containing all dates and fields for that tree and symbol).
+#
+#                If $date is in YYYYMMDD format, all other parameters must be
+#                specified.  The most recent cached data during that day will
+#                be returned, along with the exact date in YYYYMMDDHHMMSS format
+#                Return data format is ($return_date, $return_value)
+#-----------------------------------------------------------------------------
+
+sub getTSData {
+    my ($self) = @_;
+    # Expected additional parameters are $tree_id, $symbol, $date, $field
+    # but all are optional, and they are just passed through to the relevant subroutine
+    
+    if ($_[3] && $_[3] =~ /^\d{8}$/) {
+        # If $date is in YYYYMMDD format, return the latest data for that particular date
+        return $self->_getCacheDataByDate("TSData", @_[1..$#_]);
+    } else {
+        return $self->_getCacheData("TSData", @_[1..$#_]);
+    }
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        getTSDataLatest
+# Arguments:     $self                      Object reference
+#                $tree_id                   AC tree ID
+#                $symbol                    ADO symbol
+#                $field                     AC field name
+#                $before_date               Date in YYYYMMDDHHMMSS format (optional)
+# Return Values: Cached data value
+# Description:   Returns the most recent cached timeseries data for the specified
+#                parameters. All parameters (except $before_date) must be
+#                specified, unlike getTSData. If $before_date is specified,
+#                the most recent cached data before or equal to $before_date
+#                will be returned.
+#-----------------------------------------------------------------------------
+
+sub getTSDataLatest {
+    my ($self, $tree_id, $symbol, $field, $before_date) = @_;
+
+    # $before_date is optional    
+    if (!$tree_id || !$symbol || !$field) {
+        error("tree_id must be defined") unless ($tree_id);
+        error("symbol must be defined") unless ($symbol);
+        error("field must be defined") unless ($field);
+        return undef;
+    }
+
+    # $before_date must be in YYYYMMDDHHMMSS format IF specified
+    if ($before_date && !($before_date =~ /^\d{14}$/)) {
+        error("date must be in YYYYMMDDHHMMSS format");
+        return undef;
+    }
+
+    # Get array of dates, most recent first
+    my @date_keys = (reverse sort keys %{$self->{Cache}{TSData}{$tree_id}{$symbol}});
+    my $date = shift @date_keys;
+
+    # Keep shifting while $before_date (if specified) is smaller than selected $date
+    while (@date_keys && (!$before_date || $before_date < $date)) {
+        $date = shift @date_keys;
+    }
+
+    if ($date && defined $self->{Cache}{TSData}{$tree_id}{$symbol}{$date}{$field}) {
+        return $self->{Cache}{TSData}{$tree_id}{$symbol}{$date}{$field};
+    }
+    return undef;
+}
+    
+
+#-----------------------------------------------------------------------------
+# Method:        getTSStatus
+# Arguments:     $self                      Object reference
+#                $tree_id                   AC tree ID (optional)
+#                $symbol                    ADO symbol (optional)
+#                $date                      Date in YYYYMMDDHHMMSS format (optional)
+#                $field                     AC field name (optional)
+# Return Values: Either a scalar data value, or a reference to a multi-level hash
+#                (see _getCacheData)
+# Description:   Returns either the cached timeseries status for the specified
+#                parameters (if all parameters are specified) or a reference
+#                to a multi-level hash containing the remaining data (i.e.
+#                specifying $tree_id and $symbol will return a 2 level hash
+#                containing all dates and fields for that tree and symbol).
+#                Acts in a similar fashion to getTSData, however unlike GetTSData,
+#                $date must be in YYYYMMDDHHMMSS format only
+#-----------------------------------------------------------------------------
+
+sub getTSStatus {
+    my ($self) = @_;
+    # Expected additional parameters are $tree_id, $symbol, $date, $field
+    return $self->_getCacheData("TSStatus", @_[1..$#_]);
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        isTSDataCached
+# Arguments:     $self                      Object reference
+#                $tree_id                   AC tree ID
+#                $symbols                   Either a single scalar ADO symbol, or
+#                                           a reference to an array of ADO symbols
+#                $date                      Date in YYYYMMDDHHMMSS format
+#                @attributes                Array of attributes
+# Return Values: True or false
+# Description:   Returns true if all data items specified are in the cache,
+#                otherwise returns false
+#-----------------------------------------------------------------------------
+
+sub isTSDataCached {
+    my ($self, $tree_id, $symbols, $date, @attributes) = @_;
+    return $self->_isCached("TSData", $tree_id, $symbols, $date, @attributes);
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        isTSStatusCached
+# Arguments:     $self                      Object reference
+#                $tree_id                   AC tree ID
+#                $symbols                   Either a single scalar ADO symbol, or
+#                                           a reference to an array of ADO symbols
+#                $date                      Date in YYYYMMDDHHMMSS format
+#                @attributes                Array of attributes
+# Return Values: True or false
+# Description:   Returns true if all data statuses specified are in the cache,
+#                otherwise returns false
+#-----------------------------------------------------------------------------
+
+sub isTSStatusCached {
+    my ($self, $tree_id, $symbols, $date, @attributes) = @_;
+    return $self->_isCached("TSStatus", $tree_id, $symbols, $date, @attributes);
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        setEnvironment
+# Arguments:     $self                      Object reference
+#                $ac_server                 AC server name
+#                $ac_username               AC username
+#                $ac_password               AC password
+#                $ac_update_server_address  AC Query Server Address
+#                $ac_query_server_address   AC Update Server Address
+#                $ac_timeout                AC connection timeout (in seconds)
+# Return Values: none
+# Description:   Sets variables specifying which AC environment to connect to
+#-----------------------------------------------------------------------------
+
+sub setEnvironment {
+    my ($self, $ac_server, $ac_username, $ac_password, $ac_update_server_address, $ac_query_server_address, $ac_timeout) = @_;
+
+    $self->{ACEnvironment} = $self->{ACManager}->CreateEnvironment();
+    $self->{ACEnvironment}{Server} = $ac_server;
+    $self->{ACEnvironment}{UserName} = $ac_username;
+    $self->{ACEnvironment}{Password} = $ac_password;
+    $self->{ACEnvironment}{UpdateServerAddress} = $ac_update_server_address;
+    $self->{ACEnvironment}{QueryServerAddress} = $ac_query_server_address;
+    $self->{ACEnvironment}{TimeOutInSeconds} = $ac_timeout;
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        suppressInfo
+# Arguments:     $self                      Object reference
+#                $suppress_info             Flag setting whether the printing of
+#                                           INFO messages is suppressed
+# Return Values: Current suppressInfo setting
+# Description:   If $suppress_info is specified, true will stop the printing of
+#                INFO messages, and false will restart it.  If $suppress_info
+#                is not specified, returns the current setting.
+#-----------------------------------------------------------------------------
+
+sub suppressInfo {
+    my ($self, $suppress) = @_;
+    if (defined $suppress) {
+        $self->{_SuppressInfo} = ($suppress ? 1 : 0);
+    }
+    return $self->{_SuppressInfo};
+}
+
+
+#=============================================================================
+# PRIVATE METHODS
+#=============================================================================
+#-----------------------------------------------------------------------------
+# Method:        _cacheADOTimeSeries
+# Arguments:     $self                      Object reference
+#                $ts_options                TSOptions object reference
+#                $fetch_ts_status           If true, time series status values
+#                                           are fetched
+#                $tree_id                   AC tree ID
+#                $symbols                   Either a single scalar ADO symbol, or
+#                                           a reference to an array of ADO symbols
+#                @attributes                Array of attributes
+# Return Values: Reference to cached data
+# Description:   Caches timeseries data for the specified list of ADO symbols
+#                and attributes from the specified tree.
+#                N.B. IMPORTANT - One of the SetWindow methods should have been
+#                called on $ts_options BEFORE this subroutine is called, otherwise
+#                all data will be returned which is likely to be time-consuming.
+#                See cacheADOTimeSeriesLatest and cacheADOTimeSeriesByDateRange
+#                for examples.
+#-----------------------------------------------------------------------------
+
+sub _cacheADOTimeSeries {
+    my ($self, $ts_options, $fetch_ts_status, $tree_id, $symbols, @attributes) = @_;
+
+    fail("$tree_id is not a valid tree ID") unless ($self->_checkDataSourceName($tree_id));
+    $ts_options->{DataSourceName} = $tree_id;
+
+    my $ts_fields = $self->{ACManager}->CreateTSFieldDefCollection();
+    foreach my $attribute (@attributes) {
+        if (!defined $ts_fields->AddItem($self->{ACManager}->CreateTSFieldDef($attribute))) {
+            # field has not been added
+            fail("Attribute $attribute is not valid");
+        }
+    }
+
+    if (!ref($symbols)) {
+        $ts_options->AddSymbol($symbols);
+    } elsif (ref($symbols) eq "ARRAY") {
+        foreach my $symbol (@{$symbols}) {
+            $ts_options->AddSymbol($symbol);
+        }
+    }
+    $ts_options->SetFieldDefs($ts_fields);
+
+    my $ts_set = $self->{ACManager}->GetTimeSeries($ts_options);
+    fail("Could not retrieve time series data for tree $tree_id") unless (defined $ts_set);
+
+    # Cache the field names.
+    my $max_field_number = $ts_set->NumberOfFields - 1;
+    my @field_names = ();
+    foreach my $field_count (0..$max_field_number) {
+        push @field_names, $ts_set->FieldName($field_count);
+    }
+
+    # Loop through result set and add to cache
+    my $retrieved = "0";
+    foreach my $symbol_count (0..($ts_set->NumberOfSymbols - 1)) {
+        my $symbol = $ts_set->Symbol($symbol_count);
+        foreach my $record_count (0..($ts_set->NumberOfRecords($symbol_count) - 1)) {
+            my $record_date = $self->{ACManager}->ConvertCOMDateTimeToACDateTime($ts_set->RecordDateTime($symbol_count, int($record_count)));
+            foreach my $field_count (0..$max_field_number) {
+                if ($ts_set->FieldIsNull($symbol_count, int($record_count), $field_count)) {
+                    # Set cache data to undef so that _isCached will return true
+                    $self->{Cache}{TSData}{$tree_id}{$symbol}{$record_date}{$field_names[$field_count]} = undef;
+                } else {
+                    # Using FieldValue appears to be faster than using FieldInteger, FieldFloat and FieldString
+                    my $value = $ts_set->FieldValue($symbol_count, int($record_count), $field_count);
+                    $self->{Cache}{TSData}{$tree_id}{$symbol}{$record_date}{$field_names[$field_count]} = $value;
+                    if ( $fetch_ts_status ) {
+                        my $status = $ts_set->FieldStatus($symbol_count, int($record_count), $field_count);
+                        $self->{Cache}{TSStatus}{$tree_id}{$symbol}{$record_date}{$field_names[$field_count]} = $status;
+                    }
+                }
+            }
+            $retrieved++;
+        }
+    }
+    info("$retrieved records retrieved") unless ($self->{_SuppressInfo});
+    if (exists $self->{Cache}{TSData}{$tree_id}) {
+        return %{$self->{Cache}{TSData}{$tree_id}};
+    }
+    return undef;
+
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        _checkDataSourceName
+# Arguments:     $self                      Object reference
+#                @tree_ids                  Array of AC tree IDs
+# Return Values: true or false
+# Description:   Populates the cache with a list of valid trees from AC if
+#                necessary, then checks for the existence of the specified
+#                tree IDs in the cache.  Returns true unless one of the tree
+#                IDs is not found.
+#-----------------------------------------------------------------------------
+
+sub _checkDataSourceName {
+    my ($self, @tree_ids) = @_;
+    my $retval = 1;
+
+    # Cache valid tree IDs if necessary
+    if (!defined $self->{Cache}{ValidTreeIDs}) {
+        my $ts_data_sources = $self->{ACManager}->getTSDataSources();
+        for (my $count = 0; $count < ($ts_data_sources->{Count}); $count++) {
+            $self->{Cache}{ValidTreeIDs}{$ts_data_sources->GetDataSource($count)->{Name}} = 1;
+        }
+    }
+
+    foreach my $tree_id (@tree_ids) {
+        if (!exists $self->{Cache}{ValidTreeIDs}{$tree_id}) {
+            $retval = 0;
+        }
+    }
+    
+    return $retval;
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        _getCacheData
+# Arguments:     $self                      Object reference
+#                $data_type                 Cache data type (e.g. TSData)
+#                $tree_id                   AC tree ID (optional)
+#                $symbol                    ADO symbol (optional)
+#                $date                      Date in YYYYMMDDHHMMSS format (optional)
+#                $field                     AC field name (optional)
+# Return Values: undef, scalar or reference
+# Description:   Calls _getHashValue for a particular $data_type
+#-----------------------------------------------------------------------------
+
+sub _getCacheData {
+    my ($self, $data_type) = @_;
+    # Expected additional parameters are $tree_id, $symbol, $date, $field
+
+    my $retval = undef;
+    if (exists $self->{Cache}{$data_type}) {
+        $retval = $self->_getHashValue($self->{Cache}{$data_type}, @_[2..$#_]);
+    }
+    return $retval;
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        _getCacheDataByDate
+# Arguments:     $self                      Object reference
+#                $data_type                 Cache data type (e.g. TSData)
+#                $tree_id                   AC tree ID
+#                $symbol                    ADO symbol
+#                $date                      Date in YYYYMMDD format
+#                $field                     AC field name
+# Return Values: scalar from cache
+# Description:   Returns data from the cache for the specified parameters.
+#                Will return the most recent data on the date specified.
+#-----------------------------------------------------------------------------
+
+sub _getCacheDataByDate {
+    my ($self, $data_type, $tree_id, $symbol, $date, $field) = @_;
+
+    if (!$tree_id || !$symbol || !$date || !$field) {
+        error("tree_id must be defined") unless ($tree_id);
+        error("symbol must be defined") unless ($symbol);
+        error("date must be defined") unless ($date);
+        error("field must be defined") unless ($field);
+        return undef;
+    }
+
+    my $retval = undef;
+    my $retdate = undef;
+    if (defined $self->{Cache}{$data_type}{$tree_id}{$symbol}) {
+        # Loop through dates; since the keys have been sorted and they are in YYYYMMDDHHMMSS format,
+        # the most recent will be the last
+        foreach my $dateKey (sort keys %{$self->{Cache}{$data_type}{$tree_id}{$symbol}}) {
+            if ($dateKey =~ /^$date/) {
+                $retval = $self->{Cache}{$data_type}{$tree_id}{$symbol}{$dateKey}{$field};
+                $retdate = $dateKey;
+            }
+        }
+    }
+    if (defined $retval) {
+        return $retdate, $retval;
+    } else {
+        return undef;
+    }
+
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        _getHashValue
+# Arguments:     $self                      Object reference
+#                $ref                       Reference to a multi-level hash
+#                $key                       Key for the next level of the hash
+#                @remain                    Any remaining keys
+# Return Values: undef, scalar or reference
+# Description:   Recursive sub that walks through a multi-level hash.  A
+#                reference to the hash and a number of keys are passed as
+#                parameters.  If the first key exists in the hash, the reference
+#                to the next level of the hash and the remaining keys are used
+#                to recurse into the next level.  Will return the value found
+#                (either a reference or a scalar) once all keys have been
+#                successfully traversed, or undef if one of the keys does not
+#                exist.
+#-----------------------------------------------------------------------------
+
+sub _getHashValue {
+    my ($self, $ref, $key, @remain) = @_;
+
+    # $ref is a multi-level hash with an arbitrary depth, i.e. $ref->{key1}{key2}..{keyN}
+    # The other parameters are keys, starting from the topmost level.
+    # If the keys exist, the hash will be traversed and the value for the final key returned
+    # i.e. if called with the above $ref and (key1, key2) as parameters, {key3}..{keyN} will be returned
+    #
+    # List of parameters:
+    # $ref: reference to a hash
+    # $key: key for an entry in that hash
+    # @remain: any remaining keys for the next levels of the hash
+    
+    if (defined $key) {
+        if (exists $ref->{$key}) {
+            if (@remain) {
+                # There are remaining parameters, continue traversing the hash
+                return $self->_getHashValue($ref->{$key}, $remain[0], @remain[1..$#remain])
+            } else {
+                # No remaining parameters; this is the value required
+                return $ref->{$key};
+            }
+        }
+    }
+    # Key not defined or does not exist
+    return undef;
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        _getHashValue
+# Arguments:     $self                      Object reference
+#                $data_type                 Cache data type (e.g. TSData)
+#                $tree_id                   AC tree ID
+#                $symbol                    ADO symbol
+#                $date                      Date in YYYYMMDD format
+#                $field                     AC field name
+# Return Values: true or false
+# Description:   Returns true if the data specified exists in the cache
+#-----------------------------------------------------------------------------
+
+sub _isCached {
+    my ($self, $data_type, $tree_id, $symbols, $date, @attributes) = @_;
+
+    if (!$data_type || !$tree_id || !$symbols || !$date || !@attributes) {
+        error("data_type must be defined") unless ($data_type);
+        error("tree_id must be defined") unless ($tree_id);
+        error("symbol must be defined") unless ($symbols);
+        error("date must be defined") unless ($date);
+        error("field must be defined") unless (@attributes);
+        return 0;
+    }
+
+    # If $symbols is a scalar, turn it into a reference to an array containing the original scalar
+    if (!ref($symbols)) {
+        $symbols = [$symbols];
+    }
+
+    foreach my $symbol (@$symbols) {
+        foreach my $attribute (@attributes) {
+            if (!exists $self->{Cache}{$data_type}{$tree_id}{$symbol}{$date}{$attribute}) {
+                return 0;
+            }
+        }
+    }
+    
+    return 1;
+}
+
+
+#-----------------------------------------------------------------------------
+# Method:        info, fail, error, _info, _fail, _error
+# Arguments:     varies
+# Return Values: varies
+# Description:   Overload some of the functions in RefLog and RefExit to
+#                automatically add the calling sub name to the standard call.
+#-----------------------------------------------------------------------------
+
+{
+    # Turn off warnings locally so the following functions can be overloaded
+    local $^W = 0;
+    eval 'sub info { _info(@_); }';
+    eval 'sub fail { _fail(@_); }';
+    eval 'sub error { _error(@_); }';
+}
+
+
+sub _info {
+    my ($msg) = @_;
+    my ($package, $filename, $line, $subroutine) = caller(2);
+    $subroutine =~ s/::/->/g;
+    refLog::info("$subroutine: " . ($msg || ""));
+}
+
+
+sub _fail {
+    my ($msg, $code) = @_;
+    my ($package, $filename, $line, $subroutine) = caller(2);
+    $subroutine =~ s/::/->/g;
+    refExit::fail("$subroutine: " . ($msg || ""), ($code || -1));
+}
+
+
+sub _error {
+    my ($msg, $code) = @_;
+    my ($package, $filename, $line, $subroutine) = caller(2);
+    $subroutine =~ s/::/->/g;
+    refLog::error("$subroutine: " . ($msg || ""), ($code || -1));
+}
+
+
+1;
+
+__END__
+
+=head1 NAME
+
+refTimeSeries module - Retrieve Asset Control timeseries data via the Win32 API
+
+=head1 SYNOPSIS
+
+ use refTimeSeries;
+
+ my $ts = refTimeSeries->new($server, $user, $pwd, $query_server, $update_server, $timeout);
+ $ts->cacheADOTimeSeriesByDate("IBOXBarclaysDaily", "20051101", "DBT00012345", "BID", "ASK");
+
+ my $bid = $ts->getTSDataLatest("IBOXBarclaysDaily ", "DBT00012345", "BID");
+ my $ask = $ts->getTSDataLatest("IBOXBarclaysDaily ", "DBT00012345", "ASK")
+
+ $ts->disconnect;
+
+ $ts->connect;
+ my $ts_data =  $ts->cacheADOTimeSeriesByDate("IBOXBarclaysDaily", "20051101", "DBT00012345", "MID", "SPREAD");
+ my $mid = $ts_data->{IBOXBarclaysDaily}{20051101235959}{DBT00012345}{MID};
+
+=head1 DESCRIPTION
+
+refTimeSeries provides access to Asset Control timeseries data via the API using Win32::OLE.  Data
+retrieved is stored in a cache for later retrieval without re-querying Asset Control.
+
+=head1 FUNCTIONS
+
+=over 4
+
+=item new($ac_server, $ac_username, $ac_password, $ac_update_server_address, $ac_query_server_address, $ac_timeout, $suppress_info)
+
+Returns a new instance of refTimeSeries. If any parameters are passed, C<connect>
+will be called with those parameters. C<suppressInfo> will be called if $suppress_info
+is defined. $ac_timeout is the AC connection timeout in seconds.
+
+=item cacheADOTimeSeriesByDate($tree_id, $symbols, $date, @attributes)
+
+Retrieves data from Asset Control for the specified tree, date, one or more ADO symbols and
+one or more attributes. $date must be in YYYYMMDD format. $symbols is either a scalar value
+identifying a single ADO symbol, or a reference to an array of ADO symbols.
+
+Returns a reference to the retrieved data in the cache, or undef if an error occurred.
+
+The following three sections of code are identical, except for the fact that the first section
+will make 2 API calls, and the others will only make 1:
+
+    $ts->cacheADOTimeSeriesByDate("IBOXBarclaysDaily", "DBT00012345", "20051101", "BID", "ASK")
+    $ts->cacheADOTimeSeriesByDate("IBOXBarclaysDaily", "DBT00054321", "20051101", "BID", "ASK")
+
+    $ts->cacheADOTimeSeriesByDate("IBOXBarclaysDaily", ["DBT00012345", "DBT00054321"], "20051101", "BID", "ASK")
+    
+    my @symbols = ("DBT00012345", "DBT00054321");
+    $ts->cacheADOTimeSeriesByDate("IBOXBarclaysDaily", \@symbols, "20051101", "BID", "ASK")
+
+=item cacheADOTimeSeriesByDateRange($tree_id, $symbols, $start_date, $end_date, @attributes)
+
+Retrieves data in the same manner as C<cacheADOTimeSeriesByDate>, except over a date range, rather
+than a single date.  $start_date and $end_date can be in either YYYYMMDD or YYYYMMDDHHMMSS format. 
+
+=item cacheADOTimeSeriesLatest($tree_id, $symbols, @attributes)
+
+Retrieves data in the same manner as C<cacheADOTimeSeriesByDate>, except the data retrieved is
+the most recent available.
+
+=item cacheADOTimeSeriesFull($fetch_ts_status,$tree_id, $symbols, @attributes)
+
+Retrieves full time series for the supplied symbols.
+
+If fetch_ts_status is true then field statuses are retrieved, otherwise they are skipped
+to save time and memory.
+
+=item clearCache()
+
+Clears the cache of retrieved timeseries data.
+
+=item connect($ac_server, $ac_username, $ac_password, $ac_update_server_address, $ac_query_server_address, $ac_timeout)
+
+Connects to Asset Control using the API.  Either parameters must be supplied, or a previous call
+to C<setEnvironment> must have been made.
+
+=item disconnect()
+
+Disconnects from Asset Control.
+
+=item getTSData([$tree_id], [$symbol], [$date], [$field])
+
+If all the parameters are specified, returns the cached data for the specified tree, ADO symbol, date and
+field.  Returns undef if the data does not exist. 
+
+If not all the parameters are specified, returns a (possibly multi-level) hash containing the
+remaining cached data.  For example:
+
+    $retval = $ts->GetData("IBOXBarclaysDaily", "DBT00012345");
+    $data = $retval->{$date}{$field};
+
+B<Date not specified or date in YYYYMMDDHHMMSS format:>
+$field is optional; behaviour as above
+
+B<Date in YYYYMMDD format:>
+All parameters must be specified.  The most recent data found for the specified date will be returned.
+The return value is ($return_date, $return_value) where $return_date is the date in YYYYMMDDHHMMSS
+format of the returned data, and $return_value is the returned data. If no data is found for the
+specified date, then undef will be returned.
+
+=item getTSDataLatest($tree_id, $symbol, $field, [$before_date])
+
+Retrieves the most recent cached data for the specified tree, ADO symbol and field.  If $before_date is
+specified, only returns cached data from before or equal to $before_date.  Returns undef if the
+cached data does not exist.
+
+=item getTSStatus([$tree_id], [$symbol], [$date], [$field])
+
+Retrieves the cached status for a field in the same manner as C<getTSData> above.
+
+=item isTSDataCached($tree_id, $symbols, $date, @attributes)
+
+Retrieves true or false depending on whether the data specified is currently in the cache.
+All parameters must be specified. $symbols is either a scalar value
+identifying a single ADO symbol, or a reference to an array of ADO symbols.  If more that
+one item of data is referred to (i.e. if there is more than one symbol or attribute specified),
+true will only be returned if ALL of the data items are in the cache.
+
+=item isTSStatusCached($tree_id, $symbols, $date, @attributes)
+
+Retrieves true or false depending on whether the status specified is currently in the cache in
+exactly the same manner as C<isTSDataCached> above.
+
+=item setEnvironment($ac_server, $ac_username, $ac_password, $ac_update_server_address, $ac_query_server_address, $ac_timeout)
+
+Sets the parameters used to connect to an Asset Control environment, but does not make a
+connection. Use C<connect> above to make a connection.
+
+=item suppressInfo($suppress)
+
+(Default is false) If $suppress is true, stops the printing of INFO messages.  If $suppress
+is false, starts the printing of INFO messages.  If called without an argument (i.e. $suppress
+is undefined) returns the current value of $suppress.
+
+=back
+
+=head1 AUTHOR
+
+Toby Long-Leather <Toby.Long-Leather@barclayscapital.com>
+
+=head1 HISTORY
+
+REFIT 3317 - Haver Economic Data Feeds
+    - Added cacheADOTimeSeriesFull method
+    - Performance enhancements
+
+=head1 VERSION
+
+1.1
+
+=cut
